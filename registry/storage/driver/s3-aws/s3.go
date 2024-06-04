@@ -68,6 +68,8 @@ const (
 	// above which multipart copy will be used. (PUT Object - Copy is used
 	// for objects at or below this size.)  Empirically, 32 MB is optimal.
 	defaultMultipartCopyThresholdSize = 32 * 1024 * 1024
+
+	defaultTransportReadBufferSize = 1 << 20
 )
 
 // listMax is the largest amount of objects you can request from S3 in a list call
@@ -539,13 +541,15 @@ func New(ctx context.Context, params DriverParameters) (*Driver, error) {
 		awsConfig.UseDualStackEndpoint = endpoints.DualStackEndpointStateEnabled
 	}
 
+	httpTransport := http.DefaultTransport.(*http.Transport).Clone()
+	httpTransport.ReadBufferSize = defaultTransportReadBufferSize
+
 	if params.SkipVerify {
-		httpTransport := http.DefaultTransport.(*http.Transport).Clone()
 		httpTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-		awsConfig.WithHTTPClient(&http.Client{
-			Transport: httpTransport,
-		})
 	}
+	awsConfig.WithHTTPClient(&http.Client{
+		Transport: httpTransport,
+	})
 
 	sess, err := session.NewSession(awsConfig)
 	if err != nil {
