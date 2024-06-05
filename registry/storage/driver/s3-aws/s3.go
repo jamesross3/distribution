@@ -19,7 +19,9 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -27,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -543,6 +546,7 @@ func New(ctx context.Context, params DriverParameters) (*Driver, error) {
 
 	httpTransport := http.DefaultTransport.(*http.Transport).Clone()
 	httpTransport.ReadBufferSize = defaultTransportReadBufferSize
+	httpTransport.DialTLSContext = createDialTLSContextFuncForTransport(httpTransport)
 
 	if params.SkipVerify {
 		httpTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
@@ -610,6 +614,70 @@ func New(ctx context.Context, params DriverParameters) (*Driver, error) {
 			},
 		},
 	}, nil
+}
+
+func createDialTLSContextFuncForTransport(transport *http.Transport) func(ctx context.Context, network, addr string) (c net.Conn, err error) {
+	return func(ctx context.Context, network, addr string) (c net.Conn, err error) {
+		var firstTLSHost string
+		if firstTLSHost, _, err = net.SplitHostPort(addr); err != nil {
+			return nil, err
+		}
+
+		cfg := transport.TLSClientConfig.Clone()
+		cfg.ServerName = firstTLSHost
+
+		trace := httptrace.ContextClientTrace(ctx)
+
+		plainConn, err := transport.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+
+		tlsConn := tls.Client(plainConn, cfg)
+		increaseTLSBufferSizeUnsafely(tlsConn)
+
+		errc := make(chan error, 2)
+		var timer *time.Timer // for canceling TLS handshake
+		if d := transport.TLSHandshakeTimeout; d != 0 {
+			timer = time.AfterFunc(d, func() {
+				errc <- errors.New("TLS handshake timeout")
+			})
+		}
+		go func() {
+			if trace != nil && trace.TLSHandshakeStart != nil {
+				trace.TLSHandshakeStart()
+			}
+			err := tlsConn.Handshake()
+			if timer != nil {
+				timer.Stop()
+			}
+			errc <- err
+		}()
+		if err := <-errc; err != nil {
+			err = errors.Join(err, plainConn.Close())
+			if trace != nil && trace.TLSHandshakeDone != nil {
+				trace.TLSHandshakeDone(tls.ConnectionState{}, err)
+			}
+			return nil, err
+		}
+		cs := tlsConn.ConnectionState()
+		if trace != nil && trace.TLSHandshakeDone != nil {
+			trace.TLSHandshakeDone(cs, nil)
+		}
+
+		return tlsConn, nil
+	}
+}
+
+func increaseTLSBufferSizeUnsafely(tlsConn *tls.Conn) {
+	var (
+		pointerVal = reflect.ValueOf(tlsConn)
+		val        = reflect.Indirect(pointerVal)
+		member     = val.FieldByName("rawInput")
+		ptrToY     = unsafe.Pointer(member.UnsafeAddr())
+		realPtrToY = (*bytes.Buffer)(ptrToY)
+	)
+	*realPtrToY = *bytes.NewBuffer(make([]byte, 0, 1<<20))
 }
 
 // Implement the storagedriver.StorageDriver interface
